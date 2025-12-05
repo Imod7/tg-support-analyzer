@@ -1,4 +1,6 @@
+use chrono::DateTime;
 use colored::Colorize;
+use docx_rs::*;
 use dotenv::dotenv;
 use reqwest::Client;
 use serde::Deserialize;
@@ -66,8 +68,8 @@ async fn get_message(
     let mut tx = pool.begin().await?;
 
     sqlx::query(
-    r#"INSERT INTO updates (entry_type, chat_id, user_id, message_text, date) VALUES ($1, $2, $3, $4, $5)
-        ON CONFLICT (chat_id, user_id, message_text, date) DO NOTHING"#,
+    r#"INSERT INTO updates (entry_type, chat_id, user_id, message_text, date_msg) VALUES ($1, $2, $3, $4, $5)
+        ON CONFLICT (chat_id, user_id, message_text, date_msg) DO NOTHING"#,
     )
     .bind("message")
     .bind(chat_id)
@@ -82,7 +84,8 @@ async fn get_message(
 
 async fn fetch_messages() -> Result<(), Box<dyn std::error::Error>> {
     dotenv().ok();
-    let bot_token = env::var("TELEGRAM_BOT_TOKEN").expect("TELEGRAM_BOT_TOKEN environment variable is not set");
+    let bot_token =
+        env::var("TELEGRAM_BOT_TOKEN").expect("TELEGRAM_BOT_TOKEN environment variable is not set");
     let bot_token_string: &str = bot_token.as_str();
     let database_url =
         env::var("DATABASE_URL").expect("DATABASE_URL environment variable is not set");
@@ -135,8 +138,8 @@ async fn fetch_messages() -> Result<(), Box<dyn std::error::Error>> {
                 let mut tx = pool.begin().await?;
 
                 sqlx::query(
-                    r#"INSERT INTO updates (entry_type, chat_id, user_id, message_text, date) VALUES ($1, $2, $3, $4, $5)
-                    ON CONFLICT (chat_id, user_id, message_text, date) DO NOTHING"#,
+                    r#"INSERT INTO updates (entry_type, chat_id, user_id, message_text, date_msg) VALUES ($1, $2, $3, $4, $5)
+                    ON CONFLICT (chat_id, user_id, message_text, date_msg) DO NOTHING"#,
                 )
                 .bind("my_chat_member")
                 .bind(chat.chat.id)
@@ -155,7 +158,7 @@ async fn fetch_messages() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-async fn get_conversations() -> Result<(), Box<dyn std::error::Error>> {
+async fn get_conversations(date_arg: &str) -> Result<(), Box<dyn std::error::Error>> {
     dotenv().ok();
     let database_url =
         env::var("DATABASE_URL").expect("DATABASE_URL environment variable is not set");
@@ -168,21 +171,57 @@ async fn get_conversations() -> Result<(), Box<dyn std::error::Error>> {
 
     let updates = sqlx::query!(
         r#"
-    SELECT DISTINCT ON (chat_id)
-        chat_id,
-        user_id,
-        message_text,
-        date
-    FROM updates
-    ORDER BY chat_id, date DESC
-    "#
+         SELECT
+            u.chat_id,
+            u.user_id,
+            u.message_text,
+            u.date_msg,
+            c.chat_title as "chat_title?"
+        FROM updates u
+        LEFT JOIN chats c ON u.chat_id = c.chat_id
+        ORDER BY u.chat_id, u.date_msg ASC
+        "#
     )
     .fetch_all(&pool)
     .await?;
 
     for update in updates {
-        println!("Chat: {}, Message: {}", update.chat_id, update.message_text);
+        let timestamp = &update.date_msg.parse::<i64>().unwrap();
+        let dt = DateTime::from_timestamp(*timestamp, 0).unwrap();
+        let date = dt.format("%Y-%m-%d").to_string();
+        let chat_title = update
+            .chat_title
+            .unwrap_or_else(|| "Unknown Chat".to_string());
+        if date == date_arg {
+            println!(
+                "Chat: {} - {}, Message: {}, Date: {} - {}",
+                update.chat_id.custom_color((168, 251, 211)),
+                chat_title.custom_color((168, 251, 211)),
+                update.message_text.custom_color((201, 104, 104)),
+                update.date_msg,
+                date
+            );
+        }
     }
+    print_report().await?;
+    Ok(())
+}
+
+async fn print_report() -> Result<(), DocxError> {
+    let path = std::path::Path::new("./report.docx");
+    let file = std::fs::File::create(path).unwrap();
+    Docx::new()
+        .add_paragraph(Paragraph::new().add_run(
+            Run::new().add_text("Can you summarise all the following interaction and give:"),
+        ))
+        .add_paragraph(Paragraph::new().add_run(Run::new().add_text("- Issue Title ")))
+        .add_paragraph(Paragraph::new().add_run(Run::new().add_text("- Issue Description")))
+        .add_paragraph(Paragraph::new().add_run(Run::new().add_text("- Resolution Summary")))
+        .add_paragraph(Paragraph::new().add_run(
+            Run::new().add_text("- Suggest a Category where the Issue should Fall under?"),
+        ))
+        .build()
+        .pack(file)?;
     Ok(())
 }
 
@@ -209,10 +248,9 @@ async fn print_help() {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().collect();
-
     match args[1].as_str() {
         "sync-messages" => fetch_messages().await?,
-        "get-conversations" => get_conversations().await?,
+        "get-conversations" => get_conversations(args[2].as_str()).await?,
         "help" => print_help().await,
         _ => (),
     }
