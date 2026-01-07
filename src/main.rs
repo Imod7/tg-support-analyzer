@@ -1,6 +1,5 @@
 use chrono::DateTime;
 use colored::Colorize;
-use docx_rs::*;
 use dotenv::dotenv;
 use reqwest::Client;
 use serde::Deserialize;
@@ -8,6 +7,8 @@ use sqlx::postgres::PgPoolOptions;
 use sqlx::{Pool, Postgres};
 use std::env;
 use std::option::Option;
+
+pub mod report;
 
 #[derive(Debug, Deserialize)]
 struct User {
@@ -44,6 +45,17 @@ struct MessageBody {
 #[derive(Debug, Deserialize)]
 struct TelegramResponse {
     result: Vec<MessageBody>,
+}
+
+async fn connect_to_db() -> Result<Pool<Postgres>, Box<dyn std::error::Error>> {
+    let database_url =
+        env::var("DATABASE_URL").expect("DATABASE_URL environment variable is not set");
+    let pool: Pool<Postgres> = PgPoolOptions::new()
+        .max_connections(5)
+        .connect(&database_url)
+        .await?;
+    println!("Successfully connected to the database!");
+    Ok(pool)
 }
 
 async fn get_message(
@@ -87,14 +99,7 @@ async fn fetch_messages() -> Result<(), Box<dyn std::error::Error>> {
     let bot_token =
         env::var("TELEGRAM_BOT_TOKEN").expect("TELEGRAM_BOT_TOKEN environment variable is not set");
     let bot_token_string: &str = bot_token.as_str();
-    let database_url =
-        env::var("DATABASE_URL").expect("DATABASE_URL environment variable is not set");
-    let pool: Pool<Postgres> = PgPoolOptions::new()
-        .max_connections(5)
-        .connect(&database_url)
-        .await?;
-    println!("Successfully connected to the database!");
-
+    let pool = connect_to_db().await?;
     let tg_get_updates = format!(
         "https://api.telegram.org/bot{}/getUpdates",
         bot_token_string
@@ -160,15 +165,8 @@ async fn fetch_messages() -> Result<(), Box<dyn std::error::Error>> {
 
 async fn get_conversations(date_arg: &str) -> Result<(), Box<dyn std::error::Error>> {
     dotenv().ok();
-    let database_url =
-        env::var("DATABASE_URL").expect("DATABASE_URL environment variable is not set");
-    let pool: Pool<Postgres> = PgPoolOptions::new()
-        .max_connections(5)
-        .connect(&database_url)
-        .await?;
-    println!("Successfully connected to the database!");
+    let pool = connect_to_db().await?;
     let _ = pool.begin().await?;
-
     let updates = sqlx::query!(
         r#"
          SELECT
@@ -184,7 +182,7 @@ async fn get_conversations(date_arg: &str) -> Result<(), Box<dyn std::error::Err
     )
     .fetch_all(&pool)
     .await?;
-
+    let mut chat_id_title = String::new();
     for update in updates {
         let timestamp = &update.date_msg.parse::<i64>().unwrap();
         let dt = DateTime::from_timestamp(*timestamp, 0).unwrap();
@@ -193,35 +191,51 @@ async fn get_conversations(date_arg: &str) -> Result<(), Box<dyn std::error::Err
             .chat_title
             .unwrap_or_else(|| "Unknown Chat".to_string());
         if date == date_arg {
+            if chat_id_title != update.chat_id {
+                chat_id_title = update.chat_id.clone();
+                println!(
+                    "Chat: {} - {}",
+                    update.chat_id.custom_color((168, 251, 211)),
+                    chat_title.custom_color((168, 251, 211)),
+                );
+                print_prompts();
+            }
             println!(
-                "Chat: {} - {}, Message: {}, Date: {} - {}",
-                update.chat_id.custom_color((168, 251, 211)),
-                chat_title.custom_color((168, 251, 211)),
+                "Message: {}",
+                // update.chat_id.custom_color((168, 251, 211)),
+                // chat_title.custom_color((168, 251, 211)),
                 update.message_text.custom_color((201, 104, 104)),
-                update.date_msg,
-                date
+                // update.date_msg,
+                // date
             );
         }
     }
-    print_report().await?;
     Ok(())
 }
 
-async fn print_report() -> Result<(), DocxError> {
-    let path = std::path::Path::new("./report.docx");
-    let file = std::fs::File::create(path).unwrap();
-    Docx::new()
-        .add_paragraph(Paragraph::new().add_run(
-            Run::new().add_text("Can you summarise all the following interaction and give:"),
-        ))
-        .add_paragraph(Paragraph::new().add_run(Run::new().add_text("- Issue Title ")))
-        .add_paragraph(Paragraph::new().add_run(Run::new().add_text("- Issue Description")))
-        .add_paragraph(Paragraph::new().add_run(Run::new().add_text("- Resolution Summary")))
-        .add_paragraph(Paragraph::new().add_run(
-            Run::new().add_text("- Suggest a Category where the Issue should Fall under?"),
-        ))
-        .build()
-        .pack(file)?;
+fn print_prompts() {
+    println!("Can you summarise all the following interaction and give:");
+    println!("- Issue Title ");
+    println!("- Issue Description");
+    println!("- Resolution Summary");
+    println!("- Suggest a Category where the Issue should Fall under?");
+}
+
+async fn print_report(date_arg: &str) -> Result<(), Box<dyn std::error::Error>> {
+    dotenv().ok();
+    let pool = connect_to_db().await?;
+    let weeks = sqlx::query!(
+        r#"
+         SELECT
+            w.week_number
+        FROM weeks w
+        WHERE week_number = 2
+        "#
+    )
+    .fetch_one(&pool)
+    .await?;
+    println!(" {:?}", weeks.week_number);
+    let _ = report::report::print_to_document(weeks.week_number);
     Ok(())
 }
 
@@ -251,6 +265,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     match args[1].as_str() {
         "sync-messages" => fetch_messages().await?,
         "get-conversations" => get_conversations(args[2].as_str()).await?,
+        "print-report" => print_report(args[2].as_str()).await?,
         "help" => print_help().await,
         _ => (),
     }
